@@ -1,0 +1,442 @@
+---
+- name: Crashdump cleanup (purge mdmp) program deploy
+  when: (ACTION is defined) and (ACTION == 'DEPLOY')
+  block:
+
+    # NOTE: Code is divided into 3 sections - PRECHECKS, MAIN LOGIC and POSTCHECKS
+    # Pre and post checks are mainly for collecting data for the output CSV
+    # Block and rescue sections are present for MAIN LOGIC, so that overall success or failure can be determined
+    # If Main logic has a failure, error message needs to be reviewed using the output CSV and 
+    # rollback needs to be manually triggered from SSP portal for the failed scenario if needed
+
+    # PRE-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_before
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_before
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_before
+    
+    # MAIN LOGIC
+    - name: Main Logic execution
+      block:
+
+        # Check if program folder exists. If not, create it
+        - name: Check if program and backup folders exist
+          ansible.windows.win_file:
+            path: "{{ item }}"
+            state: directory
+          with_items:
+            - "{{ CRASHDUMPCLEANUP_BACKUPS_FOLDER }}"
+            - "{{ CRASHDUMPCLEANUP_TARGET_FOLDER }}"
+        
+        # Take a backup of exe and config file if they exist
+        - name: Backup exe file
+          when: exe_exists_before.stat.exists
+          win_copy:
+            src: "{{ CRASHDUMPCLEANUP_EXE_PATH }}"
+            dest: "{{ CRASHDUMPCLEANUP_BACKUPS_FOLDER }}\\"
+            force: yes
+            remote_src: true
+
+        - name: Backup config file
+          when: cfg_exists_before.stat.exists
+          win_copy:
+            src: "{{ CRASHDUMPCLEANUP_CONFIG_FILE_PATH }}"
+            dest: "{{ CRASHDUMPCLEANUP_BACKUPS_FOLDER }}\\"
+            force: yes
+            remote_src: true
+        
+        # Download latest exe and config from Blob storage, and unzip the files
+        - name: Download zip file
+          run_once: true
+          delegate_to: localhost
+          ansible.builtin.command:
+            argv:
+              -  "python{{PYTHON_VERSION}}"
+              -  "{{ BLOB_DOWNLOAD_PYTHON_SCRIPT_PATH }}"
+              -  "-d"
+              -  "{{ CRASHDUMPCLEANUP_BLOB_CONTAINER_NAME }}"
+              -  "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_NAME }}"
+              -  "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_DOWNLOAD_PATH }}/{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_NAME }}"
+        
+        - name: Recursively find all files in download folder
+          run_once: true
+          delegate_to: localhost
+          register: df_res
+          ansible.builtin.find:
+            paths: "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_DOWNLOAD_PATH }}"
+            recurse: yes
+        
+        - debug:
+            var: df_res
+          
+        - name: Unzip the files
+          run_once: true
+          delegate_to: localhost
+          ansible.builtin.command:
+            argv:
+              -  "python{{PYTHON_VERSION}}"
+              -  "-m"
+              -  "zipfile"
+              -  "-e"
+              -  "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_DOWNLOAD_PATH }}/{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_NAME }}"
+              -  "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_DOWNLOAD_PATH }}/"
+        
+        - name: Recursively find all files in download folder
+          run_once: true
+          delegate_to: localhost
+          register: df_res
+          ansible.builtin.find:
+            paths: "{{ CRASHDUMPCLEANUP_BLOB_ZIP_FILE_DOWNLOAD_PATH }}"
+            recurse: yes
+        
+        - debug:
+            var: df_res
+            
+        # Stop the program if it is already running
+        - name: Stop currently running windows task schedule and kill any running instances
+          register: taskkill_result
+          win_shell: |
+            if (Get-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore){
+              Stop-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore
+              Start-Sleep -Seconds 5
+              taskkill /f /t /im {{CRASHDUMPCLEANUP_EXE_NAME}} /fi "status eq running"
+              Start-Sleep -Seconds 5
+              taskkill /f /t /im {{CRASHDUMPCLEANUP_EXE_NAME}} /fi "status eq running"
+              Disable-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore
+            } else {
+              echo "Scheduled task does not exist"
+            }
+        
+        - name: Show taskkill result
+          debug:
+            var: taskkill_result        
+
+        # Copy the exe and config files to remote target
+        - name: Copy the files to target
+          win_copy:
+            src: "{{ item }}"
+            dest: "{{ CRASHDUMPCLEANUP_TARGET_FOLDER }}"
+            force: yes
+            remote_src: false
+          with_items:
+            - "{{ CRASHDUMPCLEANUP_EXE_NAME }}"
+            - "{{ CRASHDUMPCLEANUP_CONFIG_FILE_NAME }}"
+        
+        # Setup the scheduled task
+        - name: TaskName
+          community.windows.win_scheduled_task:
+            name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+            description: "{{CRASHDUMPCLEANUP_TASK_DESCRIPTION}}"
+            run_level: highest
+            logon_type: password    # Run whether user logged on or not
+            # username: "{{ hostvars[groups['combined_inv'][0]].ansible_user }}"
+            username: "{{ lookup('env', 'NON_EXPIRING_USER_ACCOUNT') }}"
+            # username: "j1016781"
+            # password: "{{ hostvars[groups['combined_inv'][0]].ansible_password }}"
+            password: "{{ lookup('env', 'NON_EXPIRING_USER_ACCOUNT_PASSWORD') }}"
+            update_password: yes
+            multiple_instances: 2 # Value 2 means do not start a new instance if another one is already running
+            allow_demand_start: true
+            actions:
+              - path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+                working_directory : "{{CRASHDUMPCLEANUP_TARGET_FOLDER}}"
+            triggers:
+              - type: daily
+                start_boundary: '2023-08-01T00:02:00'
+                repetition:
+                  interval: "PT{{ CRASHDUMPCLEANUP_TASK_FREQUENCY_MINS }}M"
+                  # duration: '' # an empty value should mean it last infinitely
+                  duration: "P1D" # Duration of 1 day
+            state: present
+            enabled: "{{ENABLE_YN}}"
+
+        # Capture final result
+        - name: Gather current result
+          set_fact:
+            cur_res: 'Deployment successful'
+
+      rescue:
+        - debug:
+            var: ansible_failed_result
+
+        - name: Gather current result
+          set_fact:
+            cur_res: '"Deployment failed - {{ansible_failed_result}}"'
+
+    # POST-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_after
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_after
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_after
+
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},{{exe_exists_before.stat.exists}},{{task_stat_before.task_exists}},{{task_stat_before.settings.enabled if "settings" in task_stat_before else "-NA-"}},{{exe_exists_after.stat.exists}},{{task_stat_after.task_exists}},{{task_stat_after.settings.enabled if "settings" in task_stat_after else "-NA-"}},"{{cur_res}}"'
+
+  rescue:
+    - debug:
+        var: ansible_failed_result
+              
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},,,,,,,"{{ansible_failed_result}}"'
+        
+  tags:
+    - never
+    - DEPLOY-cloudapps-crashdumpcleanup
+    - DEPLOY-cloudapps-all
+
+
+
+- name: Disk cleanup (purge mdmp) program rollback
+  when: (ACTION is defined) and (ACTION == 'ROLLBACK')
+  block:
+
+    # NOTE: Code is divided into 3 sections - PRECHECKS, MAIN LOGIC and POSTCHECKS
+    # Pre and post checks are mainly for collecting data for the output CSV
+    # Block and rescue sections are present for MAIN LOGIC, so that overall success or failure can be determined
+    # If Main logic has a failure, error message needs to be reviewed using the output CSV and 
+    # rollback needs to be manually triggered from SSP portal for the failed scenario if needed
+
+    # PRE-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_before
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_before
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_before
+    
+    # MAIN LOGIC
+    - name: Main Logic execution
+      block:
+
+        # Check if backup folder exists. If not, exit with message
+        - name: Check if backup folder exists
+          win_stat:
+            path: "{{CRASHDUMPCLEANUP_BACKUPS_FOLDER}}"
+          register: backup_exists
+        
+        # Stop the program if it is already running
+        - name: Stop currently running windows task schedule and kill any running instances
+          when: backup_exists.stat.exists
+          register: taskkill_result
+          win_shell: |
+            if (Get-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore){
+              Stop-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore
+              Start-Sleep -Seconds 5
+              taskkill /f /t /im {{CRASHDUMPCLEANUP_EXE_NAME}} /fi "status eq running"
+              Start-Sleep -Seconds 5
+              taskkill /f /t /im {{CRASHDUMPCLEANUP_EXE_NAME}} /fi "status eq running"
+              Disable-ScheduledTask -TaskName {{CRASHDUMPCLEANUP_TASK_NAME}} -ErrorAction Ignore
+            } else {
+              echo "Scheduled task does not exist"
+            }
+        
+        - name: Show taskkill result
+          when: backup_exists.stat.exists
+          debug:
+            var: taskkill_result
+        
+        # Copy the exe and config files from backup to root folder
+        - name: Copy the files to target
+          when: backup_exists.stat.exists
+          win_copy:
+            src: "{{ item }}"
+            dest: "{{ CRASHDUMPCLEANUP_TARGET_FOLDER }}"
+            force: yes
+            remote_src: true
+          with_items:
+            - "{{CRASHDUMPCLEANUP_BACKUPS_FOLDER}}\\{{ CRASHDUMPCLEANUP_EXE_NAME }}"
+            - "{{CRASHDUMPCLEANUP_BACKUPS_FOLDER}}\\{{ CRASHDUMPCLEANUP_CONFIG_FILE_NAME }}"
+        
+        # Setup the scheduled task only if the task already exists
+        - name: TaskName
+          when: backup_exists.stat.exists and task_stat_before.task_exists
+          community.windows.win_scheduled_task:
+            name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+            description: "{{CRASHDUMPCLEANUP_TASK_DESCRIPTION}}"
+            run_level: highest
+            logon_type: password    # Run whether user logged on or not
+            # username: "{{ hostvars[groups['combined_inv'][0]].ansible_user }}"
+            username: "{{ lookup('env', 'NON_EXPIRING_USER_ACCOUNT') }}"
+            # username: "j1016781"
+            # password: "{{ hostvars[groups['combined_inv'][0]].ansible_password }}"
+            password: "{{ lookup('env', 'NON_EXPIRING_USER_ACCOUNT_PASSWORD') }}"
+            update_password: yes
+            multiple_instances: 2 # Value 2 means do not start a new instance if another one is already running
+            allow_demand_start: true
+            actions:
+              - path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+                working_directory : "{{CRASHDUMPCLEANUP_TARGET_FOLDER}}"
+            triggers:
+              - type: daily
+                start_boundary: '2023-08-01T00:02:00'
+                repetition:
+                  interval: "PT{{ CRASHDUMPCLEANUP_TASK_FREQUENCY_MINS }}M"
+                  # duration: '' # an empty value should mean it last infinitely
+                  duration: "P1D" # Duration of 1 day
+            state: present
+            enabled: "{{ENABLE_YN}}"
+
+        # Capture final result
+        - name: Gather current result
+          when: backup_exists.stat.exists
+          set_fact:
+            cur_res: 'Rollback successful'
+        
+        - name: Gather current result
+          when: not backup_exists.stat.exists
+          set_fact:
+            cur_res: 'Rollback could not be performed since backup folder is not available'
+
+      rescue:
+        - debug:
+            var: ansible_failed_result
+
+        - name: Gather current result
+          set_fact:
+            cur_res: '"Rollback failed - {{ansible_failed_result}}"'
+
+    # POST-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_after
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_after
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_after
+
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},{{exe_exists_before.stat.exists}},{{task_stat_before.task_exists}},{{task_stat_before.settings.enabled if "settings" in task_stat_before else "-NA-"}},{{exe_exists_after.stat.exists}},{{task_stat_after.task_exists}},{{task_stat_after.settings.enabled if "settings" in task_stat_after else "-NA-"}},"{{cur_res}}"'
+
+  rescue:
+    - debug:
+        var: ansible_failed_result
+              
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},,,,,,,"{{ansible_failed_result}}"'
+        
+  tags:
+    - never
+    - ROLLBACK-cloudapps-crashdumpcleanup
+    - ROLLBACK-cloudapps-all
+
+
+
+
+- name: Disk cleanup (purge mdmp) program data fetch
+  when: (ACTION is defined) and (ACTION == 'FETCH')
+  block:
+
+    # NOTE: Code is divided into 3 sections - PRECHECKS, MAIN LOGIC and POSTCHECKS
+    # Pre and post checks are mainly for collecting data for the output CSV
+    # Block and rescue sections are present for MAIN LOGIC, so that overall success or failure can be determined
+    # If Main logic has a failure, error message needs to be reviewed using the output CSV and 
+    # rollback needs to be manually triggered from SSP portal for the failed scenario if needed
+
+    # PRE-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_before
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_before
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_before
+    
+    # MAIN LOGIC
+    - name: Main Logic execution
+      block:
+        - name: Gather current result
+          set_fact:
+            cur_res: 'Fetch successful'        
+
+      rescue:
+        - debug:
+            var: ansible_failed_result
+
+        - name: Gather current result
+          set_fact:
+            cur_res: '"Fetch failed - {{ansible_failed_result}}"'
+
+    # POST-CHECKS FOR OUTPUT CSV
+    - name: Check if exe file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_EXE_PATH}}"
+      register: exe_exists_after
+    
+    - name: Check if config file exists
+      win_stat:
+        path: "{{CRASHDUMPCLEANUP_CONFIG_FILE_PATH}}"
+      register: cfg_exists_after
+    
+    - name: Check if task schedule exists
+      community.windows.win_scheduled_task_stat:
+        name: "{{CRASHDUMPCLEANUP_TASK_NAME}}"
+      register: task_stat_after
+
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},{{exe_exists_before.stat.exists}},{{task_stat_before.task_exists}},{{task_stat_before.settings.enabled if "settings" in task_stat_before else "-NA-"}},{{exe_exists_after.stat.exists}},{{task_stat_after.task_exists}},{{task_stat_after.settings.enabled if "settings" in task_stat_after else "-NA-"}},"{{cur_res}}"'
+
+  rescue:
+    - debug:
+        var: ansible_failed_result
+              
+    # CREATE FINAL OUTPUT FOR CSV FILE
+    - name: Gather result for report
+      set_fact:
+        line_for_report_crashdumpcleanup: '{{inventory_hostname}},{{CRASHDUMPCLEANUP_TASK_NAME}},{{CRASHDUMPCLEANUP_TARGET_FOLDER}},,,,,,,"{{ansible_failed_result}}"'
+        
+  tags:
+    - never
+    - FETCH-cloudapps-crashdumpcleanup
+    - FETCH-cloudapps-all
